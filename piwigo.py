@@ -22,17 +22,37 @@ class Piwigo(BasePlugin[PiwigoConfig]):
 
     @hookimpl
     def start(self):
+        logger.error("PIWIGO: start() wurde aufgerufen!")
+        
         if not self._config.enabled:
-            logger.info("Piwigo Plugin ist deaktiviert.")
+            logger.error("PIWIGO: Plugin ist deaktiviert!")
             return
 
-        # Den EventBus holen wir uns sicherheitshalber erst beim Start
         from photobooth.container import container
-        container.event_bus.subscribe("post_capture", self._on_post_capture)
-        logger.info("Piwigo Plugin gestartet und am EventBus registriert.")
+        
+        # SPIONAGE: Wir listen alle Attribute des Containers auf
+        attrs = dir(container)
+        logger.error(f"PIWIGO: Container Attribute: {attrs}")
+
+        # Wir suchen gezielt nach etwas, das 'event' im Namen hat
+        event_related = [a for a in attrs if "event" in a.lower()]
+        logger.error(f"PIWIGO: Event-Verdächtige Attribute: {event_related}")
+
+        # Versuch einer automatischen Zuweisung, falls wir einen Treffer haben
+        if event_related:
+            target = event_related[0]
+            self._event_bus = getattr(container, target)
+            self._event_bus.subscribe("post_capture", self._on_post_capture)
+            logger.error(f"PIWIGO: Versuche Abo auf Attribut '{target}'")
+        else:
+            logger.error("PIWIGO: Absolut nichts mit 'event' im Container gefunden!")
 
     def _on_post_capture(self, media_item):
+        # TEST-LOG: Diese Zeile muss erscheinen, sobald ein Foto fertig ist!
+        logger.info(f"EVENT EMPFANGEN: post_capture getriggert für {media_item.filename}")
+
         if not self._config.enabled:
+            logger.warning("Piwigo Upload übersprungen: Plugin ist in Config deaktiviert!")
             return
 
         image_path = media_item.path_full
