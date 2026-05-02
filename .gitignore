@@ -18,6 +18,8 @@ lib/
 lib64/
 parts/
 sdist/
+
+# Configuration files with sensitive data
 var/
 wheels/
 share/python-wheels/
