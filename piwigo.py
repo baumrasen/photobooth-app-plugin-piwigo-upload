@@ -2,7 +2,8 @@ import logging
 import requests
 import time
 import json
-from datetime import datetime
+import threading
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from photobooth.plugins import hookimpl
 from photobooth.plugins.base_plugin import BasePlugin
@@ -53,54 +54,62 @@ class Piwigo(BasePlugin[PiwigoConfig]):
     @hookimpl
     def sm_after_transition(self, source, target, event, mediaitem_type):
         if target.id == "completed":
-            actual_type = mediaitem_type.value if hasattr(mediaitem_type, 'value') else str(mediaitem_type)
-            
-            from photobooth.container import container
-            import time
+            # Starte den Upload-Prozess in einem separaten Thread, um die State Machine nicht zu blockieren
+            thread = threading.Thread(target=self._handle_upload, args=(mediaitem_type,))
+            thread.daemon = True
+            thread.start()
 
-            # 1. Wartezeit (Collagen brauchen Zeit zum Speichern!)
-            time.sleep(2.5 if actual_type == "collage" else 1.0)
-
-            # 2. Wir nutzen die sichere Methode 'list_items'
-            try:
-                # 1. Wir holen mehr Items (z.B. 50), um den Zeitversatz zu überbrücken
-                items = container.mediacollection_service.db.list_items(limit=50)
-                
-                if items:
-                    # 2. Sortierung prüfen
-                    # Wir sortieren nach 'created_at'. 
-                    # Da es ein datetime-Objekt ist, funktioniert das normalerweise.
-                    items.sort(key=lambda x: x.created_at, reverse=True)
-                    
-                    # DEBUG: Zeig uns mal die Zeiten der ersten 3 Items im Log
-                    for i in range(min(3, len(items))):
-                        logger.error(f"PIWIGO_TIME_CHECK: Item {i} Zeit: {items[i].created_at}")
-
-                    target_item = None
-                    for item in items:
-                        if str(item.media_type.value) == actual_type:
-                            target_item = item
-                            # Wir prüfen, ob das Item "frisch" ist (nicht älter als 5 Minuten)
-                            # Das verhindert, dass bei einem Fehler alte Bilder hochgeladen werden
-                            break
+    def _handle_upload(self, mediaitem_type):
+        actual_type = mediaitem_type.value if hasattr(mediaitem_type, 'value') else str(mediaitem_type)
         
-                    if target_item:
-                        logger.error(f"PIWIGO: Erfolg! Neueste Collage gefunden. ID: {target_item.id}, Erstellt am: {target_item.created_at}")
-                        
-                        # Da 'path_full' im Objekt fehlt, müssen wir es über den Service holen:
-                        #full_path = container.mediacollection_service.get_item_path_full(target_item.id)
-                        
-                        # Wir fügen den Pfad temporär an das Objekt an, damit _do_upload ihn findet
-                        #target_item.path_full = full_path
-                        
-                        self._do_upload(target_item)
-                    else:
-                        logger.error(f"PIWIGO: Kein Item vom Typ {actual_type} in der Liste gefunden.")
+        from photobooth.container import container
+        import time
+        from datetime import datetime
+
+        # Zeitstempel des Hooks speichern (in UTC)
+        hook_trigger_time = datetime.now(timezone.utc)
+
+        # 1. Wartezeit (Collagen brauchen Zeit zum Speichern!)
+        # time.sleep(5.0 if actual_type == "collage" else 2.0)
+
+        # 2. Wir greifen direkt auf das zuletzt erstellte Item zu, aber prüfen den Zeitstempel
+        max_retries = 30
+        retry_delay = 1
+        for attempt in range(max_retries):
+            try:
+                target_item = container.mediacollection_service.get_item_latest()
+
+                if not target_item:
+                    logger.error("PIWIGO: Kein aktuelles Item gefunden.")
+                    time.sleep(retry_delay)
+                    continue
+
+                item_type = getattr(target_item.media_type, 'value', str(target_item.media_type))
+                # Normalisiere created_at zu UTC
+                item_created_at = target_item.created_at
+                if item_created_at.tzinfo is None:
+                    item_created_at = item_created_at.replace(tzinfo=timezone.utc)
                 else:
-                    logger.error("PIWIGO: Datenbank-Liste ist leer.")
-                    
+                    item_created_at = item_created_at.astimezone(timezone.utc)
+                logger.error(f"PIWIGO_TIME_CHECK: Latest item type {item_type}, time {item_created_at}, id {target_item.id}, hook time {hook_trigger_time}")
+
+                if item_type != actual_type:
+                    logger.error(f"PIWIGO: Aktuellstes Item ist Typ {item_type}, erwartet {actual_type}. Upload übersprungen.")
+                    return
+
+                # Prüfen, ob das Item nach dem Hook-Trigger erstellt wurde (mit 10s Toleranz)
+                if item_created_at >= hook_trigger_time - timedelta(seconds=5):
+                    logger.error(f"PIWIGO: Erfolg! Aktuellstes Item gefunden und zeitlich passend. ID: {target_item.id}, Erstellt am: {target_item.created_at}")
+                    self._do_upload(target_item)
+                    return
+                else:
+                    logger.error(f"PIWIGO: Item zu alt ({item_created_at} <= {hook_trigger_time}), warte und versuche erneut ({attempt+1}/{max_retries})")
+                    time.sleep(retry_delay)
             except Exception as e:
                 logger.error(f"PIWIGO_CRITICAL: Fehler bei der Bildsuche: {e}")
+                time.sleep(retry_delay)
+
+        logger.error("PIWIGO: Nach mehreren Versuchen kein passendes Item gefunden. Upload abgebrochen.")
 
     def _do_upload(self, media_item):
         raw_path = str(media_item.processed) if media_item.processed else str(media_item.captured_original)
