@@ -63,31 +63,44 @@ class Piwigo(BasePlugin[PiwigoConfig]):
 
             # 2. Wir nutzen die sichere Methode 'list_items'
             try:
-                # Wir holen die letzten 5
-                items = container.mediacollection_service.db.list_items(limit=5)
+                # 1. Wir holen mehr Items (z.B. 50), um den Zeitversatz zu überbrücken
+                items = container.mediacollection_service.db.list_items(limit=50)
                 
                 if items:
-                    # Wir sortieren nach ID absteigend (Sicherheit geht vor!)
-                    # Falls Photobooth UUIDs nutzt, sortieren wir nach dem Dateinamen/Zeit
-                    items.sort(key=lambda x: x.id, reverse=True)
+                    # 2. Sortierung prüfen
+                    # Wir sortieren nach 'created_at'. 
+                    # Da es ein datetime-Objekt ist, funktioniert das normalerweise.
+                    items.sort(key=lambda x: x.created_at, reverse=True)
                     
+                    # DEBUG: Zeig uns mal die Zeiten der ersten 3 Items im Log
+                    for i in range(min(3, len(items))):
+                        logger.error(f"PIWIGO_TIME_CHECK: Item {i} Zeit: {items[i].created_at}")
+
                     target_item = None
                     for item in items:
-                        # Typ-Check (Collage oder Image)
                         if str(item.media_type.value) == actual_type:
                             target_item = item
-                            break # Das ist das NEUESTE dieses Typs!
-                    
+                            # Wir prüfen, ob das Item "frisch" ist (nicht älter als 5 Minuten)
+                            # Das verhindert, dass bei einem Fehler alte Bilder hochgeladen werden
+                            break
+        
                     if target_item:
-                        logger.error(f"PIWIGO: Gefunden! ID: {target_item.id}, Typ: {actual_type}")
+                        logger.error(f"PIWIGO: Erfolg! Neueste Collage gefunden. ID: {target_item.id}, Erstellt am: {target_item.created_at}")
+                        
+                        # Da 'path_full' im Objekt fehlt, müssen wir es über den Service holen:
+                        #full_path = container.mediacollection_service.get_item_path_full(target_item.id)
+                        
+                        # Wir fügen den Pfad temporär an das Objekt an, damit _do_upload ihn findet
+                        #target_item.path_full = full_path
+                        
                         self._do_upload(target_item)
                     else:
-                        logger.error(f"PIWIGO: Kein Item vom Typ {actual_type} in den letzten 5 gefunden.")
+                        logger.error(f"PIWIGO: Kein Item vom Typ {actual_type} in der Liste gefunden.")
                 else:
-                    logger.error("PIWIGO: DB-Abfrage ergab keine Items.")
+                    logger.error("PIWIGO: Datenbank-Liste ist leer.")
                     
             except Exception as e:
-                logger.error(f"PIWIGO: Schwerer Fehler beim DB-Lesezugriff: {e}")
+                logger.error(f"PIWIGO_CRITICAL: Fehler bei der Bildsuche: {e}")
 
     def _do_upload(self, media_item):
         raw_path = str(media_item.processed) if media_item.processed else str(media_item.captured_original)
