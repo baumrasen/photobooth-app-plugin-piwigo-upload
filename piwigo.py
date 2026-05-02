@@ -54,19 +54,50 @@ class Piwigo(BasePlugin[PiwigoConfig]):
     @hookimpl
     def sm_after_transition(self, source, target, event, mediaitem_type):
         if target.id == "completed":
-            # Starte den Upload-Prozess in einem separaten Thread, um die State Machine nicht zu blockieren
+            if not self._config.enabled:
+                logger.debug("PIWIGO: Plugin disabled. Skipping upload.")
+                return
+
+            actual_type = mediaitem_type.value if hasattr(mediaitem_type, 'value') else str(mediaitem_type)
+            if not self._is_upload_enabled(actual_type):
+                logger.debug(f"PIWIGO: Upload for media type '{actual_type}' is disabled in config.")
+                return
+
+            # Start the upload process in a separate thread to avoid blocking the state machine
             thread = threading.Thread(target=self._handle_upload, args=(mediaitem_type,))
             thread.daemon = True
             thread.start()
 
+    def _is_upload_enabled(self, media_type: str) -> bool:
+        normalized = media_type.lower()
+        if normalized in ("photo", "image", "picture"):
+            return self._config.upload.image
+        if normalized == "collage":
+            return self._config.upload.collage
+        if normalized in ("animation", "gif", "animated"):
+            return self._config.upload.animation
+        if normalized in ("video", "movie"):
+            return self._config.upload.video
+
+        logger.debug(f"PIWIGO: Unknown media type '{media_type}'. Upload skipped.")
+        return False
+
     def _handle_upload(self, mediaitem_type):
         actual_type = mediaitem_type.value if hasattr(mediaitem_type, 'value') else str(mediaitem_type)
-        
+
+        if not self._config.enabled:
+            logger.debug("PIWIGO: Plugin disabled in config. Stopping upload handler.")
+            return
+
+        if not self._is_upload_enabled(actual_type):
+            logger.debug(f"PIWIGO: Upload for media type '{actual_type}' is disabled in config. Stopping upload handler.")
+            return
+
         from photobooth.container import container
         import time
         from datetime import datetime
 
-        # Zeitstempel des Hooks speichern (in UTC)
+        # Store hook timestamp in UTC
         hook_trigger_time = datetime.now(timezone.utc)
 
         # 1. Wait time (collages need time to finish saving)
@@ -120,16 +151,16 @@ class Piwigo(BasePlugin[PiwigoConfig]):
         ts = media_item.created_at if hasattr(media_item, 'created_at') else datetime.now()
         new_filename = ts.strftime("%Y%m%d_%H%M%S")
 
-        api_endpoint = f"{self._config.api_url}/ws.php?format=json"
+        api_endpoint = f"{self._config.connection.api_url}/ws.php?format=json"
         session = requests.Session()
 
         try:
             session.post(api_endpoint, data={
-                'method': 'pwg.session.login', 'username': self._config.username, 'password': self._config.password
+                'method': 'pwg.session.login', 'username': self._config.connection.username, 'password': self._config.connection.password
             })
             
             with open(image_path, 'rb') as img:
-                cat_id = str(self._config.album_id)
+                cat_id = str(self._config.connection.album_id)
                 payload = {
                     'method': 'pwg.images.addSimple',
                     'category': cat_id,
@@ -153,7 +184,7 @@ class Piwigo(BasePlugin[PiwigoConfig]):
                     'name': new_filename,
                     'multiple_value_mode': 'replace'
                 })
-                media_item.share_url = f"{self._config.api_url}/picture.php?/{img_id}"
+                media_item.share_url = f"{self._config.connection.api_url}/picture.php?/{img_id}"
                 logger.info(f"PIWIGO: Upload successful ({new_filename}.jpg)")
             else:
                 logger.error(f"PIWIGO: API error: {data}")
