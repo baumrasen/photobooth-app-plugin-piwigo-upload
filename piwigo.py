@@ -30,25 +30,25 @@ class Piwigo(BasePlugin[PiwigoConfig]):
 
 #    @hookimpl
 #    def get_share_links(self, filepath_local, identifier):
-#        # Photobooth fragt: "Welche Links hast du für dieses Bild?"
-#        # Wir suchen das Item in der DB, um zu sehen, ob wir eine share_url haben.
-#        
+#        # Photobooth asks: "What links do you have for this image?"
+#        # We search the DB for the item to see if we have a share_url.
+#
 #        from photobooth.container import container
 #        from uuid import UUID
-#        
+#
 #        links = []
 #        try:
-#            # Identifier kommt als UUID oder String
+#            # Identifier comes as UUID or string
 #            item_id = UUID(str(identifier))
 #            item = container.mediacollection_service.get_item(item_id)
-#            
+#
 #            if item and item.share_url:
-#                # Wenn wir eine URL in der DB haben, geben wir sie zurück
+#                # If we have a URL in the DB, return it
 #                links.append(item.share_url)
-#                logger.error(f"PIWIGO: Hook returns link: {item.share_url}")
+#                logger.info(f"PIWIGO: Hook returns link: {item.share_url}")
 #        except Exception as e:
 #            logger.error(f"PIWIGO: Error in get_share_links hook: {e}")
-#            
+#
 #        return links
 
     @hookimpl
