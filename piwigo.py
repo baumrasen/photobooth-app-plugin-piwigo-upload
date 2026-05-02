@@ -80,7 +80,7 @@ class Piwigo(BasePlugin[PiwigoConfig]):
                 target_item = container.mediacollection_service.get_item_latest()
 
                 if not target_item:
-                    logger.error("PIWIGO: Kein aktuelles Item gefunden.")
+                    logger.debug("PIWIGO: Kein aktuelles Item gefunden.")
                     time.sleep(retry_delay)
                     continue
 
@@ -91,19 +91,20 @@ class Piwigo(BasePlugin[PiwigoConfig]):
                     item_created_at = item_created_at.replace(tzinfo=timezone.utc)
                 else:
                     item_created_at = item_created_at.astimezone(timezone.utc)
-                logger.error(f"PIWIGO_TIME_CHECK: Latest item type {item_type}, time {item_created_at}, id {target_item.id}, hook time {hook_trigger_time}")
+                delta = hook_trigger_time - item_created_at
+                logger.debug(f"PIWIGO_TIME_CHECK: Latest item type {item_type}, time {item_created_at}, id {target_item.id}, hook time {hook_trigger_time}, delta {delta.total_seconds():.3f}s")
 
                 if item_type != actual_type:
-                    logger.error(f"PIWIGO: Aktuellstes Item ist Typ {item_type}, erwartet {actual_type}. Upload übersprungen.")
+                    logger.debug(f"PIWIGO: Aktuellstes Item ist Typ {item_type}, erwartet {actual_type}. Upload übersprungen.")
                     return
 
-                # Prüfen, ob das Item nach dem Hook-Trigger erstellt wurde (mit 10s Toleranz)
-                if item_created_at >= hook_trigger_time - timedelta(seconds=5):
-                    logger.error(f"PIWIGO: Erfolg! Aktuellstes Item gefunden und zeitlich passend. ID: {target_item.id}, Erstellt am: {target_item.created_at}")
+                # Prüfen, ob das Item nahe genug am Hook-Trigger liegt
+                if abs(delta.total_seconds()) <= 5:
+                    logger.info(f"PIWIGO: Erfolg! Aktuellstes Item gefunden und zeitlich passend. ID: {target_item.id}, Erstellt am: {target_item.created_at}, delta {delta.total_seconds():.3f}s")
                     self._do_upload(target_item)
                     return
                 else:
-                    logger.error(f"PIWIGO: Item zu alt ({item_created_at} <= {hook_trigger_time}), warte und versuche erneut ({attempt+1}/{max_retries})")
+                    logger.debug(f"PIWIGO: Item zeitlich außerhalb des Fensters ({item_created_at} delta {delta.total_seconds():.3f}s), warte und versuche erneut ({attempt+1}/{max_retries})")
                     time.sleep(retry_delay)
             except Exception as e:
                 logger.error(f"PIWIGO_CRITICAL: Fehler bei der Bildsuche: {e}")
