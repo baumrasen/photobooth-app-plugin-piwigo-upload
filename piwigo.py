@@ -1,5 +1,9 @@
 import logging
 import requests
+import time
+import json
+from datetime import datetime
+from pathlib import Path
 from photobooth.plugins import hookimpl
 from photobooth.plugins.base_plugin import BasePlugin
 from .config import PiwigoConfig
@@ -9,7 +13,7 @@ logger = logging.getLogger(__name__)
 class Piwigo(BasePlugin[PiwigoConfig]):
     def __init__(self):
         super().__init__()
-        self._config: PiwigoConfig = PiwigoConfig()
+        self._config = PiwigoConfig()
 
     @hookimpl
     def photobooth_plugin_config(self):
@@ -18,100 +22,100 @@ class Piwigo(BasePlugin[PiwigoConfig]):
     @hookimpl
     def photobooth_plugin_loaded(self, config: PiwigoConfig):
         self._config = config
-        logger.error("PIWIGO: Plugin geladen.")
 
     @hookimpl
     def start(self):
-        logger.error("PIWIGO: Plugin gestartet (Warte auf Fotos via Statemachine)...")
+        logger.info("PIWIGO: Plugin aktiv und bereit.")
 
-    # DAS IST DER ENTSCHEIDENDE HOOK AUS DEINEM CODE-FUND!
     @hookimpl
     def sm_after_transition(self, source, target, event, mediaitem_type):
-        # Wir reagieren nur auf 'completed'
+        # Wir prüfen auf target.id (das ist der String "completed")
         if target.id == "completed":
             if not self._config.enabled:
                 return
 
+            # Typ-Konvertierung (Enum zu String)
+            actual_type = mediaitem_type.value if hasattr(mediaitem_type, 'value') else str(mediaitem_type)
+            
+            # Schalter-Check (z.B. upload_collage)
+            config_attr = f"upload_{actual_type}"
+            if not getattr(self._config, config_attr, False):
+                return
+
+            logger.error(f"PIWIGO: Trigger für {actual_type} erkannt.")
+
             from photobooth.container import container
-            # Wir warten eine winzige Sekunde, damit die DB sicher geschrieben ist
             import time
-            time.sleep(0.5)
             
-            # Wir holen das letzte Bild
-            latest_item = container.mediacollection_service.get_item_latest()
+            # Etwas Zeit geben, damit die DB-Session im Hauptprogramm commiten kann
+            time.sleep(1.5 if actual_type == "collage" else 0.7)
             
-            # Sicherheitscheck: Falls das 'latest' ein altes Bild ist, 
-            # könnte man hier noch gegen mediaitem_type prüfen.
-            if latest_item:
-                self._do_upload(latest_item)
+            # KORREKTER ZUGRIFF laut deinem Code:
+            # Wir holen die neuesten Items über den db-Subservice
+            items = container.mediacollection_service.db.list_items(limit=5)
+            
+            if items:
+                # Wir suchen in den letzten 5 Items nach dem passenden Typ
+                # (Sicherer als nur das erste zu nehmen, falls die Collage einen Tick später kommt)
+                target_item = None
+                for item in items:
+                    if item.media_type.value == actual_type or str(item.media_type) == actual_type:
+                        target_item = item
+                        break
+                
+                if target_item:
+                    logger.error(f"PIWIGO: Item gefunden ({target_item.id}). Starte Upload...")
+                    self._do_upload(target_item)
+                else:
+                    logger.error(f"PIWIGO: Kein Item vom Typ {actual_type} in den letzten 5 DB-Einträgen.")
+            else:
+                logger.error("PIWIGO: Datenbank-Abfrage lieferte keine Ergebnisse.")
 
     def _do_upload(self, media_item):
-        import json
-        from pathlib import Path
-        from datetime import datetime # Neu für die Formatierung
-        
         raw_path = str(media_item.processed) if media_item.processed else str(media_item.captured_original)
         image_path = str(Path(raw_path).absolute())
 
-        # NEU: Den Namen nach Schema YYYYMMDD_HHMMSS generieren
-        # Wir versuchen created_at zu nutzen, ansonsten nehmen wir die aktuelle Zeit
-        if hasattr(media_item, 'created_at') and media_item.created_at:
-            # Falls created_at ein datetime-Objekt ist
-            new_filename = media_item.created_at.strftime("%Y%m%d_%H%M%S")
-        else:
-            new_filename = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Dateiname nach Schema YYYYMMDD_HHMMSS
+        ts = media_item.created_at if hasattr(media_item, 'created_at') else datetime.now()
+        new_filename = ts.strftime("%Y%m%d_%H%M%S")
 
         api_endpoint = f"{self._config.api_url}/ws.php?format=json"
         session = requests.Session()
 
         try:
-            # 1. Login
             session.post(api_endpoint, data={
-                'method': 'pwg.session.login',
-                'username': self._config.username,
-                'password': self._config.password
+                'method': 'pwg.session.login', 'username': self._config.username, 'password': self._config.password
             })
             
-            # 2. Upload
             with open(image_path, 'rb') as img:
-                cat_id = int(self._config.album_id)
-                
+                cat_id = str(self._config.album_id)
                 payload = {
                     'method': 'pwg.images.addSimple',
                     'category': cat_id,
                     'categories': cat_id,
-                    'name': new_filename, # Hier nutzen wir den neuen Namen (ohne .jpg, das macht Piwigo meist selbst)
+                    'name': new_filename,
                     'level': 0
                 }
+                res = session.post(api_endpoint, data=payload, files={'image': img})
                 
-                response_raw = session.post(api_endpoint, data=payload, files={'image': img})
-                
-                # JSON-Reparatur
-                content = response_raw.text
-                content = content[content.find('{'):content.rfind('}')+1]
-                response = json.loads(content)
+                # Robuster JSON-Parser für "Extra Data"
+                content = res.text
+                data = json.loads(content[content.find('{'):content.rfind('}')+1])
 
-            if response.get('stat') == 'ok':
-                image_id = response['result']['image_id']
-                
-                # Optional: Den Dateinamen auch als "Title" setzen via setInfo
+            if data.get('stat') == 'ok':
+                img_id = data['result']['image_id']
+                # Verknüpfung erzwingen & Titel setzen
                 session.post(api_endpoint, data={
                     'method': 'pwg.images.setInfo',
-                    'image_id': image_id,
-                    'file': f"{new_filename}.jpg", # Setzt den echten Dateinamen
-                    'name': new_filename,          # Setzt den Titel in Piwigo
+                    'image_id': img_id,
                     'categories': cat_id,
+                    'name': new_filename,
                     'multiple_value_mode': 'replace'
                 })
-
-                media_item.share_url = f"{self._config.api_url}/picture.php?/{image_id}"
-                logger.error(f"PIWIGO: ERFOLG! Name: {new_filename}.jpg, ID: {image_id}")
+                media_item.share_url = f"{self._config.api_url}/picture.php?/{img_id}"
+                logger.info(f"PIWIGO: Upload erfolgreich ({new_filename}.jpg)")
             else:
-                logger.error(f"PIWIGO: API Fehler: {response}")
+                logger.error(f"PIWIGO: API Fehler: {data}")
 
         except Exception as e:
-            logger.error(f"PIWIGO: Fehler: {e}")
-
-    @hookimpl
-    def stop(self):
-        pass
+            logger.error(f"PIWIGO: Fehler beim Upload: {e}")
