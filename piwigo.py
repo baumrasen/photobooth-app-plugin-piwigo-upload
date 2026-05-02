@@ -18,49 +18,50 @@ class Piwigo(BasePlugin[PiwigoConfig]):
     @hookimpl
     def photobooth_plugin_loaded(self, config: PiwigoConfig):
         self._config = config
-        logger.info("Piwigo Plugin geladen.")
+        logger.error("PIWIGO: Plugin geladen.")
 
     @hookimpl
     def start(self):
-        logger.error("PIWIGO: start() wurde aufgerufen!")
+        logger.error("PIWIGO: Plugin gestartet (Warte auf Fotos via Statemachine)...")
+
+    # DAS IST DER ENTSCHEIDENDE HOOK AUS DEINEM CODE-FUND!
+    @hookimpl
+    def sm_after_transition(self, source, target, event, mediaitem_type):
+        """Wird von PluginEventHooks nach jedem Zustandswechsel gerufen."""
         
-        if not self._config.enabled:
-            logger.error("PIWIGO: Plugin ist deaktiviert!")
-            return
+        # Wir reagieren nur, wenn die Statemachine 'completed' erreicht
+        # target.id ist laut deinem Code 'completed'
+        if target.id == "completed":
+            logger.error(f"PIWIGO: Statemachine ist 'completed'. Starte Upload-Check...")
+            
+            if not self._config.enabled:
+                return
 
-        from photobooth.container import container
+            # Wir brauchen das neueste Medien-Item aus der Datenbank
+            from photobooth.container import container
+            latest_item = container.mediacollection_service.get_item_latest()
+            
+            if latest_item:
+                self._do_upload(latest_item)
+            else:
+                logger.error("PIWIGO: Kein Bild in der Datenbank gefunden!")
+
+    def _do_upload(self, media_item):
+        import json
         
-        # SPIONAGE: Wir listen alle Attribute des Containers auf
-        attrs = dir(container)
-        logger.error(f"PIWIGO: Container Attribute: {attrs}")
+        # 1. Absoluten Pfad sicherstellen
+        # Falls der Pfad relativ ist (wie im Log), machen wir ihn absolut
+        raw_path = str(media_item.processed) if media_item.processed else str(media_item.captured_original)
+        from pathlib import Path
+        image_path = str(Path(raw_path).absolute())
 
-        # Wir suchen gezielt nach etwas, das 'event' im Namen hat
-        event_related = [a for a in attrs if "event" in a.lower()]
-        logger.error(f"PIWIGO: Event-Verdächtige Attribute: {event_related}")
+        logger.error(f"PIWIGO: Upload startet! Absoluter Pfad: {image_path}")
 
-        # Versuch einer automatischen Zuweisung, falls wir einen Treffer haben
-        if event_related:
-            target = event_related[0]
-            self._event_bus = getattr(container, target)
-            self._event_bus.subscribe("post_capture", self._on_post_capture)
-            logger.error(f"PIWIGO: Versuche Abo auf Attribut '{target}'")
-        else:
-            logger.error("PIWIGO: Absolut nichts mit 'event' im Container gefunden!")
-
-    def _on_post_capture(self, media_item):
-        # TEST-LOG: Diese Zeile muss erscheinen, sobald ein Foto fertig ist!
-        logger.info(f"EVENT EMPFANGEN: post_capture getriggert für {media_item.filename}")
-
-        if not self._config.enabled:
-            logger.warning("Piwigo Upload übersprungen: Plugin ist in Config deaktiviert!")
-            return
-
-        image_path = media_item.path_full
         api_endpoint = f"{self._config.api_url}/ws.php?format=json"
+        session = requests.Session()
 
         try:
-            session = requests.Session()
-            # 1. Login
+            # Login
             session.post(api_endpoint, data={
                 'method': 'pwg.session.login',
                 'username': self._config.username,
@@ -72,21 +73,33 @@ class Piwigo(BasePlugin[PiwigoConfig]):
                 payload = {
                     'method': 'pwg.images.addSimple',
                     'category': self._config.album_id,
-                    'name': media_item.filename
+                    'name': getattr(media_item, 'id', 'upload') 
                 }
-                response = session.post(api_endpoint, data=payload, files={'image': img}).json()
+                response_raw = session.post(api_endpoint, data=payload, files={'image': img})
+                
+                # REPARATUR FÜR "EXTRA DATA":
+                # Wir nehmen nur den Teil bis zur letzten schließenden Klammer }
+                content = response_raw.text
+                last_brace = content.rfind('}')
+                if last_brace != -1:
+                    content = content[:last_brace+1]
+                
+                response = json.loads(content)
 
             if response.get('stat') == 'ok':
                 image_id = response['result']['image_id']
-                # URL für den QR-Code setzen
+                # QR-Code URL setzen
                 media_item.share_url = f"{self._config.api_url}/picture.php?/{image_id}"
-                logger.info(f"Piwigo Upload erfolgreich: {media_item.share_url}")
+                logger.error(f"PIWIGO: ERFOLG! Bild-ID: {image_id}, URL: {media_item.share_url}")
             else:
-                logger.error(f"Piwigo API Fehler: {response}")
+                logger.error(f"PIWIGO: API meldet Fehler: {response}")
 
         except Exception as e:
-            logger.error(f"Fehler im Piwigo Plugin: {e}")
+            logger.error(f"PIWIGO: Fehler beim Upload-Prozess: {e}")
+            # Falls vorhanden, zeige die rohe Antwort für das Debugging
+            if 'response_raw' in locals():
+                logger.error(f"PIWIGO: Rohe API-Antwort: {response_raw.text[:100]}")
 
     @hookimpl
     def stop(self):
-        logger.info("Piwigo Plugin gestoppt.")
+        pass
