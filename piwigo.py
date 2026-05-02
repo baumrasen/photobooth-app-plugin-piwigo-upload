@@ -170,9 +170,7 @@ class Piwigo(BasePlugin[PiwigoConfig]):
                 }
                 res = session.post(api_endpoint, data=payload, files={'image': img})
                 
-                # Robust JSON parser for "extra data"
-                content = res.text
-                data = json.loads(content[content.find('{'):content.rfind('}')+1])
+                data = res.json()
 
             if data.get('stat') == 'ok':
                 img_id = data['result']['image_id']
@@ -184,7 +182,6 @@ class Piwigo(BasePlugin[PiwigoConfig]):
                     'name': new_filename,
                     'multiple_value_mode': 'replace'
                 })
-                media_item.share_url = f"{self._config.connection.api_url}/picture.php?/{img_id}"
                 logger.info(f"PIWIGO: Upload successful ({new_filename}.jpg)")
             else:
                 logger.error(f"PIWIGO: API error: {data}")
