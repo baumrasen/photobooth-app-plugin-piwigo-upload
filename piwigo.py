@@ -26,7 +26,7 @@ class Piwigo(BasePlugin[PiwigoConfig]):
 
     @hookimpl
     def start(self):
-        logger.info("PIWIGO: Plugin aktiv und bereit.")
+        logger.info("PIWIGO: Plugin active and ready.")
 
 #    @hookimpl
 #    def get_share_links(self, filepath_local, identifier):
@@ -45,9 +45,9 @@ class Piwigo(BasePlugin[PiwigoConfig]):
 #            if item and item.share_url:
 #                # Wenn wir eine URL in der DB haben, geben wir sie zurück
 #                links.append(item.share_url)
-#                logger.error(f"PIWIGO: Hook liefert Link zurück: {item.share_url}")
+#                logger.error(f"PIWIGO: Hook returns link: {item.share_url}")
 #        except Exception as e:
-#            logger.error(f"PIWIGO: Fehler im get_share_links Hook: {e}")
+#            logger.error(f"PIWIGO: Error in get_share_links hook: {e}")
 #            
 #        return links
 
@@ -69,10 +69,10 @@ class Piwigo(BasePlugin[PiwigoConfig]):
         # Zeitstempel des Hooks speichern (in UTC)
         hook_trigger_time = datetime.now(timezone.utc)
 
-        # 1. Wartezeit (Collagen brauchen Zeit zum Speichern!)
+        # 1. Wait time (collages need time to finish saving)
         # time.sleep(5.0 if actual_type == "collage" else 2.0)
 
-        # 2. Wir greifen direkt auf das zuletzt erstellte Item zu, aber prüfen den Zeitstempel
+        # 2. Fetch the latest created item and check its timestamp
         max_retries = 30
         retry_delay = 1
         for attempt in range(max_retries):
@@ -80,12 +80,12 @@ class Piwigo(BasePlugin[PiwigoConfig]):
                 target_item = container.mediacollection_service.get_item_latest()
 
                 if not target_item:
-                    logger.debug("PIWIGO: Kein aktuelles Item gefunden.")
+                    logger.debug("PIWIGO: No current item found.")
                     time.sleep(retry_delay)
                     continue
 
                 item_type = getattr(target_item.media_type, 'value', str(target_item.media_type))
-                # Normalisiere created_at zu UTC
+                # Normalize created_at to UTC
                 item_created_at = target_item.created_at
                 if item_created_at.tzinfo is None:
                     item_created_at = item_created_at.replace(tzinfo=timezone.utc)
@@ -95,28 +95,28 @@ class Piwigo(BasePlugin[PiwigoConfig]):
                 logger.debug(f"PIWIGO_TIME_CHECK: Latest item type {item_type}, time {item_created_at}, id {target_item.id}, hook time {hook_trigger_time}, delta {delta.total_seconds():.3f}s")
 
                 if item_type != actual_type:
-                    logger.debug(f"PIWIGO: Aktuellstes Item ist Typ {item_type}, erwartet {actual_type}. Upload übersprungen.")
+                    logger.debug(f"PIWIGO: Latest item type is {item_type}, expected {actual_type}. Skipping upload.")
                     return
 
-                # Prüfen, ob das Item nahe genug am Hook-Trigger liegt
+                # Check whether the item is close enough to the hook trigger time
                 if abs(delta.total_seconds()) <= 5:
-                    logger.info(f"PIWIGO: Erfolg! Aktuellstes Item gefunden und zeitlich passend. ID: {target_item.id}, Erstellt am: {target_item.created_at}, delta {delta.total_seconds():.3f}s")
+                    logger.info(f"PIWIGO: Success! Latest item found and time-matched. ID: {target_item.id}, created at: {target_item.created_at}, delta {delta.total_seconds():.3f}s")
                     self._do_upload(target_item)
                     return
                 else:
-                    logger.debug(f"PIWIGO: Item zeitlich außerhalb des Fensters ({item_created_at} delta {delta.total_seconds():.3f}s), warte und versuche erneut ({attempt+1}/{max_retries})")
+                    logger.debug(f"PIWIGO: Item outside time window ({item_created_at} delta {delta.total_seconds():.3f}s), waiting and retrying ({attempt+1}/{max_retries})")
                     time.sleep(retry_delay)
             except Exception as e:
-                logger.error(f"PIWIGO_CRITICAL: Fehler bei der Bildsuche: {e}")
+                logger.error(f"PIWIGO_CRITICAL: Error finding image item: {e}")
                 time.sleep(retry_delay)
 
-        logger.error("PIWIGO: Nach mehreren Versuchen kein passendes Item gefunden. Upload abgebrochen.")
+        logger.error("PIWIGO: No matching item found after several attempts. Upload aborted.")
 
     def _do_upload(self, media_item):
         raw_path = str(media_item.processed) if media_item.processed else str(media_item.captured_original)
         image_path = str(Path(raw_path).absolute())
 
-        # Dateiname nach Schema YYYYMMDD_HHMMSS
+        # Filename format YYYYMMDD_HHMMSS
         ts = media_item.created_at if hasattr(media_item, 'created_at') else datetime.now()
         new_filename = ts.strftime("%Y%m%d_%H%M%S")
 
@@ -139,13 +139,13 @@ class Piwigo(BasePlugin[PiwigoConfig]):
                 }
                 res = session.post(api_endpoint, data=payload, files={'image': img})
                 
-                # Robuster JSON-Parser für "Extra Data"
+                # Robust JSON parser for "extra data"
                 content = res.text
                 data = json.loads(content[content.find('{'):content.rfind('}')+1])
 
             if data.get('stat') == 'ok':
                 img_id = data['result']['image_id']
-                # Verknüpfung erzwingen & Titel setzen
+                # Force association & set title
                 session.post(api_endpoint, data={
                     'method': 'pwg.images.setInfo',
                     'image_id': img_id,
@@ -154,9 +154,9 @@ class Piwigo(BasePlugin[PiwigoConfig]):
                     'multiple_value_mode': 'replace'
                 })
                 media_item.share_url = f"{self._config.api_url}/picture.php?/{img_id}"
-                logger.info(f"PIWIGO: Upload erfolgreich ({new_filename}.jpg)")
+                logger.info(f"PIWIGO: Upload successful ({new_filename}.jpg)")
             else:
-                logger.error(f"PIWIGO: API Fehler: {data}")
+                logger.error(f"PIWIGO: API error: {data}")
 
         except Exception as e:
-            logger.error(f"PIWIGO: Fehler beim Upload: {e}")
+            logger.error(f"PIWIGO: Upload error: {e}")
