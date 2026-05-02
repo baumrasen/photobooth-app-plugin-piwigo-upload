@@ -48,9 +48,18 @@ class Piwigo(BasePlugin[PiwigoConfig]):
     def _do_upload(self, media_item):
         import json
         from pathlib import Path
+        from datetime import datetime # Neu für die Formatierung
         
         raw_path = str(media_item.processed) if media_item.processed else str(media_item.captured_original)
         image_path = str(Path(raw_path).absolute())
+
+        # NEU: Den Namen nach Schema YYYYMMDD_HHMMSS generieren
+        # Wir versuchen created_at zu nutzen, ansonsten nehmen wir die aktuelle Zeit
+        if hasattr(media_item, 'created_at') and media_item.created_at:
+            # Falls created_at ein datetime-Objekt ist
+            new_filename = media_item.created_at.strftime("%Y%m%d_%H%M%S")
+        else:
+            new_filename = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         api_endpoint = f"{self._config.api_url}/ws.php?format=json"
         session = requests.Session()
@@ -63,16 +72,15 @@ class Piwigo(BasePlugin[PiwigoConfig]):
                 'password': self._config.password
             })
             
-            # 2. Upload mit allen Varianten für das Album
+            # 2. Upload
             with open(image_path, 'rb') as img:
-                cat_id = int(self._config.album_id) # Manche Piwigo Versionen wollen int
+                cat_id = int(self._config.album_id)
                 
                 payload = {
                     'method': 'pwg.images.addSimple',
                     'category': cat_id,
                     'categories': cat_id,
-                    'album': cat_id, # Dritte Namens-Variante
-                    'name': media_item.id,
+                    'name': new_filename, # Hier nutzen wir den neuen Namen (ohne .jpg, das macht Piwigo meist selbst)
                     'level': 0
                 }
                 
@@ -86,22 +94,18 @@ class Piwigo(BasePlugin[PiwigoConfig]):
             if response.get('stat') == 'ok':
                 image_id = response['result']['image_id']
                 
-                # JOKER: Falls es immer noch nicht im Album ist, erzwingen wir es jetzt!
-                session.post(api_endpoint, data={
-                    'method': 'pwg.images.setPrivacy',
-                    'image_id': image_id,
-                    'level': 0
-                })
-                # Bild explizit der Kategorie zuweisen
+                # Optional: Den Dateinamen auch als "Title" setzen via setInfo
                 session.post(api_endpoint, data={
                     'method': 'pwg.images.setInfo',
                     'image_id': image_id,
+                    'file': f"{new_filename}.jpg", # Setzt den echten Dateinamen
+                    'name': new_filename,          # Setzt den Titel in Piwigo
                     'categories': cat_id,
                     'multiple_value_mode': 'replace'
                 })
 
                 media_item.share_url = f"{self._config.api_url}/picture.php?/{image_id}"
-                logger.error(f"PIWIGO: ERFOLG! Bild {image_id} hochgeladen und verknüpft.")
+                logger.error(f"PIWIGO: ERFOLG! Name: {new_filename}.jpg, ID: {image_id}")
             else:
                 logger.error(f"PIWIGO: API Fehler: {response}")
 
