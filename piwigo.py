@@ -27,6 +27,29 @@ class Piwigo(BasePlugin[PiwigoConfig]):
     def start(self):
         logger.info("PIWIGO: Plugin aktiv und bereit.")
 
+#    @hookimpl
+#    def get_share_links(self, filepath_local, identifier):
+#        # Photobooth fragt: "Welche Links hast du für dieses Bild?"
+#        # Wir suchen das Item in der DB, um zu sehen, ob wir eine share_url haben.
+#        
+#        from photobooth.container import container
+#        from uuid import UUID
+#        
+#        links = []
+#        try:
+#            # Identifier kommt als UUID oder String
+#            item_id = UUID(str(identifier))
+#            item = container.mediacollection_service.get_item(item_id)
+#            
+#            if item and item.share_url:
+#                # Wenn wir eine URL in der DB haben, geben wir sie zurück
+#                links.append(item.share_url)
+#                logger.error(f"PIWIGO: Hook liefert Link zurück: {item.share_url}")
+#        except Exception as e:
+#            logger.error(f"PIWIGO: Fehler im get_share_links Hook: {e}")
+#            
+#        return links
+
     @hookimpl
     def sm_after_transition(self, source, target, event, mediaitem_type):
         # Wir prüfen auf target.id (das ist der String "completed")
@@ -72,50 +95,98 @@ class Piwigo(BasePlugin[PiwigoConfig]):
                 logger.error("PIWIGO: Datenbank-Abfrage lieferte keine Ergebnisse.")
 
     def _do_upload(self, media_item):
-        raw_path = str(media_item.processed) if media_item.processed else str(media_item.captured_original)
-        image_path = str(Path(raw_path).absolute())
+        import json
+        import requests
+        from pathlib import Path
+        from datetime import datetime
+        from photobooth.container import container
 
-        # Dateiname nach Schema YYYYMMDD_HHMMSS
-        ts = media_item.created_at if hasattr(media_item, 'created_at') else datetime.now()
-        new_filename = ts.strftime("%Y%m%d_%H%M%S")
-
-        api_endpoint = f"{self._config.api_url}/ws.php?format=json"
-        session = requests.Session()
+        logger.error("PIWIGO_DEBUG: Funktion _do_upload wurde betreten.")
 
         try:
-            session.post(api_endpoint, data={
-                'method': 'pwg.session.login', 'username': self._config.username, 'password': self._config.password
-            })
-            
+            raw_path = str(media_item.processed) if media_item.processed else str(media_item.captured_original)
+            image_path = str(Path(raw_path).absolute())
+            logger.error(f"PIWIGO_DEBUG: Pfad ermittelt: {image_path}")
+
+            api_endpoint = f"{self._config.api_url}/ws.php?format=json"
+            session = requests.Session()
+            # Falls dein Zertifikat zickt (selbstsigniert), verify=False
+            session.verify = True 
+
+            # 1. Login
+            logger.error(f"PIWIGO_DEBUG: Login-Versuch für User: {self._config.username}")
+            login_res = session.post(api_endpoint, data={
+                'method': 'pwg.session.login',
+                'username': self._config.username,
+                'password': self._config.password
+            }, timeout=10)
+            logger.error(f"PIWIGO_DEBUG: Login-Response Status: {login_res.status_code}")
+
+            # 2. Upload
+            logger.error("PIWIGO_DEBUG: Öffne Datei für Upload...")
             with open(image_path, 'rb') as img:
-                cat_id = str(self._config.album_id)
+                # Debug: Was steht in der config?
+                album_id_str = str(self._config.album_id)
+                logger.error(f"PIWIGO_DEBUG: Versuche Upload in Album-ID: '{album_id_str}'")
+
                 payload = {
-                    'method': 'pwg.images.addSimple',
-                    'category': cat_id,
-                    'categories': cat_id,
-                    'name': new_filename,
-                    'level': 0
+                    'method': 'pwg.images.addSimple', # Falls das nicht klappt, versuche 'pwg.images.upload'
+                    'category': album_id_str,
+                    'name': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                    'format': 'json' # Wichtig, damit wir eine lesbare Antwort bekommen
                 }
-                res = session.post(api_endpoint, data=payload, files={'image': img})
+
+                logger.error(f"PIWIGO_DEBUG: Sende POST an {api_endpoint} mit Payload: {payload}")
                 
-                # Robuster JSON-Parser für "Extra Data"
-                content = res.text
-                data = json.loads(content[content.find('{'):content.rfind('}')+1])
+                try:
+                    response_raw = session.post(api_endpoint, data=payload, files={'image': img}, timeout=30)
+                    
+                    # Logge den HTTP Status und den rohen Text der Antwort
+                    logger.error(f"PIWIGO_DEBUG: HTTP Status: {response_raw.status_code}")
+                    logger.error(f"PIWIGO_DEBUG: Raw Response: {response_raw.text}")
+
+                    # Versuche das JSON zu parsen für detaillierte Fehlermeldungen
+                    try:
+                        res_json = response_raw.json()
+                        if res_json.get('stat') != 'ok':
+                            logger.error(f"PIWIGO_ERROR: Piwigo meldet Fehler: {res_json.get('err')} - {res_json.get('message')}")
+                        else:
+                            logger.error(f"PIWIGO_DEBUG: Erfolg! Image ID: {res_json.get('result', {}).get('image_id')}")
+                    except Exception as json_err:
+                        logger.error(f"PIWIGO_DEBUG: Antwort ist kein gültiges JSON: {json_err}")
+
+                except Exception as e:
+                    logger.error(f"PIWIGO_DEBUG: Kritischer Fehler beim Request: {str(e)}")
+
+            # 3. JSON Parser
+            content = response_raw.text
+            logger.error(f"PIWIGO_DEBUG: Roh-Antwort (erste 50 Zeichen): {content[:50]}")
+            
+            # Extrahiere JSON
+            start = content.find('{')
+            end = content.rfind('}') + 1
+            if start == -1 or end == 0:
+                logger.error(f"PIWIGO_DEBUG: Kein JSON in Antwort gefunden! Inhalt: {content}")
+                return
+
+            data = json.loads(content[start:end])
+            logger.error(f"PIWIGO_DEBUG: JSON erfolgreich geparst. Status: {data.get('stat')}")
 
             if data.get('stat') == 'ok':
-                img_id = data['result']['image_id']
-                # Verknüpfung erzwingen & Titel setzen
-                session.post(api_endpoint, data={
-                    'method': 'pwg.images.setInfo',
-                    'image_id': img_id,
-                    'categories': cat_id,
-                    'name': new_filename,
-                    'multiple_value_mode': 'replace'
-                })
-                media_item.share_url = f"{self._config.api_url}/picture.php?/{img_id}"
-                logger.info(f"PIWIGO: Upload erfolgreich ({new_filename}.jpg)")
+                # Anstatt des Links zum Einzelbild nehmen wir den Album-Link
+                # Den Link am besten auch in die Plugin-Config (piwigo.py) packen 
+                # oder hier hart codieren:
+                
+                from photobooth.container import container
+                container.mediacollection_service.update_item(media_item)
+                
+                logger.info(f"PIWIGO: QR-Code from custom url")
             else:
-                logger.error(f"PIWIGO: API Fehler: {data}")
+                logger.error(f"PIWIGO_DEBUG: Piwigo meldet Fehler: {data}")
 
         except Exception as e:
-            logger.error(f"PIWIGO: Fehler beim Upload: {e}")
+            # Hier loggen wir den EXAKTEN Fehler-Typ und die Nachricht
+            logger.error(f"PIWIGO_CRITICAL: Fehler in _do_upload: {type(e).__name__} - {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+
