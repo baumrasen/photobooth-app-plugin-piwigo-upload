@@ -52,141 +52,88 @@ class Piwigo(BasePlugin[PiwigoConfig]):
 
     @hookimpl
     def sm_after_transition(self, source, target, event, mediaitem_type):
-        # Wir prüfen auf target.id (das ist der String "completed")
         if target.id == "completed":
-            if not self._config.enabled:
-                return
-
-            # Typ-Konvertierung (Enum zu String)
             actual_type = mediaitem_type.value if hasattr(mediaitem_type, 'value') else str(mediaitem_type)
             
-            # Schalter-Check (z.B. upload_collage)
-            config_attr = f"upload_{actual_type}"
-            if not getattr(self._config, config_attr, False):
-                return
-
-            logger.error(f"PIWIGO: Trigger für {actual_type} erkannt.")
-
             from photobooth.container import container
             import time
-            
-            # Etwas Zeit geben, damit die DB-Session im Hauptprogramm commiten kann
-            time.sleep(1.5 if actual_type == "collage" else 0.7)
-            
-            # KORREKTER ZUGRIFF laut deinem Code:
-            # Wir holen die neuesten Items über den db-Subservice
-            items = container.mediacollection_service.db.list_items(limit=5)
-            
-            if items:
-                # Wir suchen in den letzten 5 Items nach dem passenden Typ
-                # (Sicherer als nur das erste zu nehmen, falls die Collage einen Tick später kommt)
-                target_item = None
-                for item in items:
-                    if item.media_type.value == actual_type or str(item.media_type) == actual_type:
-                        target_item = item
-                        break
+
+            # 1. Wartezeit (Collagen brauchen Zeit zum Speichern!)
+            time.sleep(2.5 if actual_type == "collage" else 1.0)
+
+            # 2. Wir nutzen die sichere Methode 'list_items'
+            try:
+                # Wir holen die letzten 5
+                items = container.mediacollection_service.db.list_items(limit=5)
                 
-                if target_item:
-                    logger.error(f"PIWIGO: Item gefunden ({target_item.id}). Starte Upload...")
-                    self._do_upload(target_item)
+                if items:
+                    # Wir sortieren nach ID absteigend (Sicherheit geht vor!)
+                    # Falls Photobooth UUIDs nutzt, sortieren wir nach dem Dateinamen/Zeit
+                    items.sort(key=lambda x: x.id, reverse=True)
+                    
+                    target_item = None
+                    for item in items:
+                        # Typ-Check (Collage oder Image)
+                        if str(item.media_type.value) == actual_type:
+                            target_item = item
+                            break # Das ist das NEUESTE dieses Typs!
+                    
+                    if target_item:
+                        logger.error(f"PIWIGO: Gefunden! ID: {target_item.id}, Typ: {actual_type}")
+                        self._do_upload(target_item)
+                    else:
+                        logger.error(f"PIWIGO: Kein Item vom Typ {actual_type} in den letzten 5 gefunden.")
                 else:
-                    logger.error(f"PIWIGO: Kein Item vom Typ {actual_type} in den letzten 5 DB-Einträgen.")
-            else:
-                logger.error("PIWIGO: Datenbank-Abfrage lieferte keine Ergebnisse.")
+                    logger.error("PIWIGO: DB-Abfrage ergab keine Items.")
+                    
+            except Exception as e:
+                logger.error(f"PIWIGO: Schwerer Fehler beim DB-Lesezugriff: {e}")
 
     def _do_upload(self, media_item):
-        import json
-        import requests
-        from pathlib import Path
-        from datetime import datetime
-        from photobooth.container import container
+        raw_path = str(media_item.processed) if media_item.processed else str(media_item.captured_original)
+        image_path = str(Path(raw_path).absolute())
 
-        logger.error("PIWIGO_DEBUG: Funktion _do_upload wurde betreten.")
+        # Dateiname nach Schema YYYYMMDD_HHMMSS
+        ts = media_item.created_at if hasattr(media_item, 'created_at') else datetime.now()
+        new_filename = ts.strftime("%Y%m%d_%H%M%S")
+
+        api_endpoint = f"{self._config.api_url}/ws.php?format=json"
+        session = requests.Session()
 
         try:
-            raw_path = str(media_item.processed) if media_item.processed else str(media_item.captured_original)
-            image_path = str(Path(raw_path).absolute())
-            logger.error(f"PIWIGO_DEBUG: Pfad ermittelt: {image_path}")
-
-            api_endpoint = f"{self._config.api_url}/ws.php?format=json"
-            session = requests.Session()
-            # Falls dein Zertifikat zickt (selbstsigniert), verify=False
-            session.verify = True 
-
-            # 1. Login
-            logger.error(f"PIWIGO_DEBUG: Login-Versuch für User: {self._config.username}")
-            login_res = session.post(api_endpoint, data={
-                'method': 'pwg.session.login',
-                'username': self._config.username,
-                'password': self._config.password
-            }, timeout=10)
-            logger.error(f"PIWIGO_DEBUG: Login-Response Status: {login_res.status_code}")
-
-            # 2. Upload
-            logger.error("PIWIGO_DEBUG: Öffne Datei für Upload...")
-            with open(image_path, 'rb') as img:
-                # Debug: Was steht in der config?
-                album_id_str = str(self._config.album_id)
-                logger.error(f"PIWIGO_DEBUG: Versuche Upload in Album-ID: '{album_id_str}'")
-
-                payload = {
-                    'method': 'pwg.images.addSimple', # Falls das nicht klappt, versuche 'pwg.images.upload'
-                    'category': album_id_str,
-                    'name': datetime.now().strftime("%Y%m%d_%H%M%S"),
-                    'format': 'json' # Wichtig, damit wir eine lesbare Antwort bekommen
-                }
-
-                logger.error(f"PIWIGO_DEBUG: Sende POST an {api_endpoint} mit Payload: {payload}")
-                
-                try:
-                    response_raw = session.post(api_endpoint, data=payload, files={'image': img}, timeout=30)
-                    
-                    # Logge den HTTP Status und den rohen Text der Antwort
-                    logger.error(f"PIWIGO_DEBUG: HTTP Status: {response_raw.status_code}")
-                    logger.error(f"PIWIGO_DEBUG: Raw Response: {response_raw.text}")
-
-                    # Versuche das JSON zu parsen für detaillierte Fehlermeldungen
-                    try:
-                        res_json = response_raw.json()
-                        if res_json.get('stat') != 'ok':
-                            logger.error(f"PIWIGO_ERROR: Piwigo meldet Fehler: {res_json.get('err')} - {res_json.get('message')}")
-                        else:
-                            logger.error(f"PIWIGO_DEBUG: Erfolg! Image ID: {res_json.get('result', {}).get('image_id')}")
-                    except Exception as json_err:
-                        logger.error(f"PIWIGO_DEBUG: Antwort ist kein gültiges JSON: {json_err}")
-
-                except Exception as e:
-                    logger.error(f"PIWIGO_DEBUG: Kritischer Fehler beim Request: {str(e)}")
-
-            # 3. JSON Parser
-            content = response_raw.text
-            logger.error(f"PIWIGO_DEBUG: Roh-Antwort (erste 50 Zeichen): {content[:50]}")
+            session.post(api_endpoint, data={
+                'method': 'pwg.session.login', 'username': self._config.username, 'password': self._config.password
+            })
             
-            # Extrahiere JSON
-            start = content.find('{')
-            end = content.rfind('}') + 1
-            if start == -1 or end == 0:
-                logger.error(f"PIWIGO_DEBUG: Kein JSON in Antwort gefunden! Inhalt: {content}")
-                return
-
-            data = json.loads(content[start:end])
-            logger.error(f"PIWIGO_DEBUG: JSON erfolgreich geparst. Status: {data.get('stat')}")
+            with open(image_path, 'rb') as img:
+                cat_id = str(self._config.album_id)
+                payload = {
+                    'method': 'pwg.images.addSimple',
+                    'category': cat_id,
+                    'categories': cat_id,
+                    'name': new_filename,
+                    'level': 0
+                }
+                res = session.post(api_endpoint, data=payload, files={'image': img})
+                
+                # Robuster JSON-Parser für "Extra Data"
+                content = res.text
+                data = json.loads(content[content.find('{'):content.rfind('}')+1])
 
             if data.get('stat') == 'ok':
-                # Anstatt des Links zum Einzelbild nehmen wir den Album-Link
-                # Den Link am besten auch in die Plugin-Config (piwigo.py) packen 
-                # oder hier hart codieren:
-                
-                from photobooth.container import container
-                container.mediacollection_service.update_item(media_item)
-                
-                logger.info(f"PIWIGO: QR-Code from custom url")
+                img_id = data['result']['image_id']
+                # Verknüpfung erzwingen & Titel setzen
+                session.post(api_endpoint, data={
+                    'method': 'pwg.images.setInfo',
+                    'image_id': img_id,
+                    'categories': cat_id,
+                    'name': new_filename,
+                    'multiple_value_mode': 'replace'
+                })
+                media_item.share_url = f"{self._config.api_url}/picture.php?/{img_id}"
+                logger.info(f"PIWIGO: Upload erfolgreich ({new_filename}.jpg)")
             else:
-                logger.error(f"PIWIGO_DEBUG: Piwigo meldet Fehler: {data}")
+                logger.error(f"PIWIGO: API Fehler: {data}")
 
         except Exception as e:
-            # Hier loggen wir den EXAKTEN Fehler-Typ und die Nachricht
-            logger.error(f"PIWIGO_CRITICAL: Fehler in _do_upload: {type(e).__name__} - {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-
+            logger.error(f"PIWIGO: Fehler beim Upload: {e}")
